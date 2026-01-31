@@ -1,31 +1,21 @@
 name: XRFix Batch Analysis
 
-# Batch-run XRFix queries against multiple Unity repos
-# Reads repo list from repos_to_scan.json
-
 on:
   workflow_dispatch:
+    inputs:
+      batch_start:
+        description: 'Start index (0-based)'
+        required: true
+        default: '0'
+      batch_size:
+        description: 'Number of repos to scan in this run'
+        required: true
+        default: '10'
 
 jobs:
-  load-repos:
-    runs-on: ubuntu-latest
-    outputs:
-      matrix: ${{ steps.set-matrix.outputs.matrix }}
-    steps:
-      - uses: actions/checkout@v4
-      - id: set-matrix
-        run: |
-          echo "matrix=$(cat repos_to_scan.json)" >> $GITHUB_OUTPUT
-
   xrfix-scan:
-    needs: load-repos
     runs-on: ubuntu-latest
-    timeout-minutes: 30
-    strategy:
-      fail-fast: false
-      max-parallel: 5
-      matrix:
-        include: ${{ fromJson(needs.load-repos.outputs.matrix) }}
+    timeout-minutes: 360
 
     steps:
       - name: Checkout benchmark repo
@@ -33,85 +23,154 @@ jobs:
 
       - name: Setup CodeQL
         run: |
-          # Download CodeQL CLI
           wget -q https://github.com/github/codeql-cli-binaries/releases/download/v2.16.3/codeql-linux64.zip
           unzip -q codeql-linux64.zip
-          export PATH="$PWD/codeql:$PATH"
           echo "$PWD/codeql" >> $GITHUB_PATH
+          git clone --depth 1 --branch codeql-cli/v2.16.3 https://github.com/github/codeql.git codeql-repo
 
-          # Clone CodeQL standard library (needed for C# queries)
-          git clone --depth 1 --branch v2.16.3 https://github.com/github/codeql.git codeql-repo
-
-      - name: Clone target repo
+      - name: Run batch scan
         run: |
-          git clone --depth 500 https://github.com/${{ matrix.repo }} target_repo
-          cd target_repo
-          git checkout ${{ matrix.commit }} || echo "WARN: checkout failed"
-          CS_COUNT=$(find . -name "*.cs" | wc -l)
-          echo "C# files: $CS_COUNT"
+          START=${{ github.event.inputs.batch_start }}
+          SIZE=${{ github.event.inputs.batch_size }}
+          mkdir -p all_results
 
-      - name: Create CodeQL database
-        id: create_db
-        continue-on-error: true
-        run: |
-          codeql database create codeql-db \
-            --language=csharp \
-            --source-root=target_repo \
-            --no-run-unnecessary-builds \
-            --search-path=codeql-repo \
-            2>&1 | tail -20
+          # Read repos_to_scan.json and process batch
+          python3 << 'PYEOF'
+          import json, subprocess, os
 
-      - name: Run all XRFix queries
-        if: steps.create_db.outcome == 'success'
-        continue-on-error: true
-        run: |
-          # Copy custom queries into codeql-repo structure
-          mkdir -p codeql-repo/csharp/ql/src/unityCheck
-          cp -r xrfix_queries/* codeql-repo/csharp/ql/src/unityCheck/
+          with open("repos_to_scan.json") as f:
+              repos = json.load(f)
 
-          RESULTS_DIR="results_${{ matrix.bug_id }}"
-          mkdir -p $RESULTS_DIR
+          start = int(os.environ.get("START", "${{ github.event.inputs.batch_start }}"))
+          size = int(os.environ.get("SIZE", "${{ github.event.inputs.batch_size }}"))
+          batch = repos[start:start+size]
 
-          for ql_file in xrfix_queries/*/*.ql; do
-            QUERY_NAME=$(basename "$ql_file" .ql)
-            echo "=== Running $QUERY_NAME ==="
-            codeql database analyze codeql-db \
-              "$ql_file" \
-              --format=csv \
-              --output="$RESULTS_DIR/${QUERY_NAME}.csv" \
-              --search-path=codeql-repo \
-              --additional-packs=codeql-repo \
-              2>&1 | tail -5
+          print(f"Processing {len(batch)} repos (index {start} to {start+len(batch)-1})")
 
-            if [ -f "$RESULTS_DIR/${QUERY_NAME}.csv" ]; then
-              HITS=$(tail -n +2 "$RESULTS_DIR/${QUERY_NAME}.csv" | wc -l)
-              echo "$QUERY_NAME: $HITS findings"
-            else
-              echo "$QUERY_NAME: failed"
-            fi
-          done
+          results = []
+          for i, item in enumerate(batch):
+              repo = item["repo"]
+              commit_raw = item["commit"]
+              bug_id = item["bug_id"]
+              # Remove ~1, we'll handle parent in git
+              commit = commit_raw.replace("~1", "")
 
-      - name: Generate summary
-        run: |
-          RESULTS_DIR="results_${{ matrix.bug_id }}"
-          echo "repo=${{ matrix.repo }}" > "$RESULTS_DIR/summary.txt"
-          echo "bug_id=${{ matrix.bug_id }}" >> "$RESULTS_DIR/summary.txt"
-          echo "commit=${{ matrix.commit }}" >> "$RESULTS_DIR/summary.txt"
-          echo "db_created=${{ steps.create_db.outcome }}" >> "$RESULTS_DIR/summary.txt"
+              print(f"\n{'='*60}")
+              print(f"[{i+1}/{len(batch)}] {bug_id}")
+              print(f"Repo: {repo}, Commit: {commit}")
+              print(f"{'='*60}")
 
-          TOTAL=0
-          for f in "$RESULTS_DIR"/*.csv; do
-            if [ -f "$f" ]; then
-              C=$(tail -n +2 "$f" | wc -l)
-              TOTAL=$((TOTAL + C))
-              echo "$(basename $f): $C" >> "$RESULTS_DIR/summary.txt"
-            fi
-          done
-          echo "total_findings=$TOTAL" >> "$RESULTS_DIR/summary.txt"
-          cat "$RESULTS_DIR/summary.txt"
+              repo_dir = f"target_{i}"
+              result = {"bug_id": bug_id, "repo": repo, "commit": commit, "db_ok": False, "findings": {}}
+
+              try:
+                  # Clone
+                  r = subprocess.run(
+                      ["git", "clone", "--depth", "500", f"https://github.com/{repo}", repo_dir],
+                      capture_output=True, text=True, timeout=120
+                  )
+                  if r.returncode != 0:
+                      print(f"Clone failed: {r.stderr[:200]}")
+                      results.append(result)
+                      continue
+
+                  # Checkout parent of fix commit
+                  r = subprocess.run(
+                      ["git", "checkout", f"{commit}~1"],
+                      capture_output=True, text=True, cwd=repo_dir, timeout=30
+                  )
+                  if r.returncode != 0:
+                      # Try checkout the commit itself
+                      r = subprocess.run(
+                          ["git", "checkout", commit],
+                          capture_output=True, text=True, cwd=repo_dir, timeout=30
+                      )
+                      if r.returncode != 0:
+                          print(f"Checkout failed: {r.stderr[:200]}")
+                          results.append(result)
+                          continue
+
+                  # Count C# files
+                  cs_count = subprocess.run(
+                      ["bash", "-c", f"find {repo_dir} -name '*.cs' | wc -l"],
+                      capture_output=True, text=True
+                  )
+                  print(f"C# files: {cs_count.stdout.strip()}")
+
+                  # Create CodeQL database
+                  r = subprocess.run(
+                      ["codeql", "database", "create", f"db_{i}",
+                       "--language=csharp",
+                       f"--source-root={repo_dir}",
+                       "--no-run-unnecessary-builds",
+                       "--search-path=codeql-repo"],
+                      capture_output=True, text=True, timeout=300
+                  )
+                  if r.returncode != 0:
+                      print(f"DB creation failed: {r.stderr[:300]}")
+                      results.append(result)
+                      continue
+
+                  result["db_ok"] = True
+
+                  # Run each query
+                  queries = {
+                      "new_alloc": "xrfix_queries/allocate/comp_new_allocation.ql",
+                      "destroy": "xrfix_queries/instantiate/comp_destroy_in_update.ql",
+                      "instantiate": "xrfix_queries/instantiate/comp_instan_in_update.ql",
+                      "rigidbody": "xrfix_queries/rigidbody/comp_rigidbody_transform_in_update.ql",
+                  }
+
+                  for qname, qpath in queries.items():
+                      out_csv = f"all_results/{bug_id}_{qname}.csv"
+                      r = subprocess.run(
+                          ["codeql", "database", "analyze", f"db_{i}",
+                           qpath,
+                           "--format=csv",
+                           f"--output={out_csv}",
+                           "--search-path=codeql-repo",
+                           "--additional-packs=codeql-repo"],
+                          capture_output=True, text=True, timeout=300
+                      )
+                      if r.returncode == 0 and os.path.exists(out_csv):
+                          with open(out_csv) as cf:
+                              lines = cf.readlines()
+                          hits = max(0, len(lines) - 1)  # minus header
+                          result["findings"][qname] = hits
+                          print(f"  {qname}: {hits} findings")
+                      else:
+                          result["findings"][qname] = -1
+                          print(f"  {qname}: FAILED - {r.stderr[:100]}")
+
+              except Exception as e:
+                  print(f"Error: {e}")
+
+              finally:
+                  # Cleanup to save disk
+                  subprocess.run(["rm", "-rf", repo_dir, f"db_{i}"], capture_output=True)
+
+              results.append(result)
+
+          # Write summary
+          print(f"\n{'='*60}")
+          print("BATCH SUMMARY")
+          print(f"{'='*60}")
+          total_bugs = len(results)
+          db_ok = sum(1 for r in results if r["db_ok"])
+          detected = sum(1 for r in results if r["db_ok"] and sum(v for v in r["findings"].values() if v > 0) > 0)
+
+          print(f"Total bugs: {total_bugs}")
+          print(f"DB created successfully: {db_ok}")
+          print(f"Bugs with XRFix findings: {detected}")
+          print(f"Detection rate: {detected}/{db_ok} = {detected/max(db_ok,1)*100:.1f}%")
+
+          with open("all_results/batch_summary.json", "w") as f:
+              json.dump({"results": results, "total": total_bugs, "db_ok": db_ok, "detected": detected}, f, indent=2)
+
+          PYEOF
 
       - name: Upload results
         uses: actions/upload-artifact@v4
         with:
-          name: xrfix-${{ matrix.bug_id }}
-          path: results_${{ matrix.bug_id }}/
+          name: xrfix-batch-${{ github.event.inputs.batch_start }}
+          path: all_results/
