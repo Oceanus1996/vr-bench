@@ -1,0 +1,87 @@
+name: VR Bug Reproduction Test
+
+on:
+  workflow_dispatch:
+    inputs:
+      repo_url:
+        description: 'GitHub repo URL (e.g. https://github.com/aframevr/aframe)'
+        required: true
+      buggy_commit:
+        description: 'Buggy commit SHA'
+        required: true
+      fixed_commit:
+        description: 'Fixed commit SHA'
+        required: true
+      bug_id:
+        description: 'Bug ID for tracking'
+        required: true
+
+jobs:
+  reproduce:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout benchmark repo
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+
+      - name: Install dependencies
+        run: |
+          npm install playwright-chromium
+          npx playwright install chromium
+          npm install -g serve
+
+      - name: Clone target repo
+        run: |
+          git clone --depth 200 ${{ github.event.inputs.repo_url }} target_repo
+
+      - name: Test BUGGY version
+        id: buggy
+        continue-on-error: true
+        run: |
+          cd target_repo
+          git checkout ${{ github.event.inputs.buggy_commit }}
+          npm install 2>/dev/null || true
+          serve -l 8080 -s . &
+          sleep 5
+          cd ..
+          node test_bug.js http://localhost:8080 screenshot_buggy.png
+          kill %1 2>/dev/null || true
+
+      - name: Test FIXED version
+        id: fixed
+        continue-on-error: true
+        run: |
+          cd target_repo
+          git checkout ${{ github.event.inputs.fixed_commit }}
+          npm install 2>/dev/null || true
+          serve -l 8080 -s . &
+          sleep 5
+          cd ..
+          node test_bug.js http://localhost:8080 screenshot_fixed.png
+          kill %1 2>/dev/null || true
+
+      - name: Compare results
+        run: |
+          echo "Bug ID: ${{ github.event.inputs.bug_id }}"
+          echo "Buggy version result: ${{ steps.buggy.outcome }}"
+          echo "Fixed version result: ${{ steps.fixed.outcome }}"
+          if [ "${{ steps.buggy.outcome }}" = "failure" ] && [ "${{ steps.fixed.outcome }}" = "success" ]; then
+            echo "RESULT=reproduced" >> $GITHUB_ENV
+          else
+            echo "RESULT=inconclusive" >> $GITHUB_ENV
+          fi
+          echo "Final: $RESULT"
+
+      - name: Upload screenshots
+        uses: actions/upload-artifact@v4
+        with:
+          name: screenshots-${{ github.event.inputs.bug_id }}
+          path: |
+            screenshot_buggy.png
+            screenshot_fixed.png
