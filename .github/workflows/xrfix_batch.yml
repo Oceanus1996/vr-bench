@@ -28,6 +28,30 @@ jobs:
           echo "$PWD/codeql" >> $GITHUB_PATH
           git clone --depth 1 --branch codeql-cli/v2.16.3 https://github.com/github/codeql.git codeql-repo
 
+      - name: Setup .NET SDK
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Download Unity stubs
+        run: |
+          # Download Unity engine DLL stubs via NuGet
+          mkdir -p unity-stubs
+          cd unity-stubs
+          # Unity.Modules covers UnityEngine.dll and all sub-modules
+          dotnet new console -n stub --force
+          cd stub
+          dotnet add package Unity3D.UnityEngine --version 2020.1.0.1 || true
+          dotnet add package Unity3D.UnityEngine.UI --version 2020.1.0.1 || true
+          dotnet add package Unity3D.UnityEditor --version 2020.1.0.1 || true
+          dotnet restore || true
+          # Find where the DLLs are cached
+          find ~/.nuget/packages/unity3d* -name "*.dll" 2>/dev/null | head -20
+          STUBS_DIR=$(find ~/.nuget/packages -path "*/unity3d.unityengine/*/lib/*" -name "*.dll" -exec dirname {} \; | head -1)
+          echo "UNITY_STUBS=$STUBS_DIR" >> $GITHUB_ENV
+          echo "Unity stubs at: $STUBS_DIR"
+          ls -la "$STUBS_DIR" 2>/dev/null || echo "No stubs found, will try alternative"
+
       - name: Run batch scan
         run: |
           START=${{ github.event.inputs.batch_start }}
@@ -44,7 +68,7 @@ jobs:
 
           # Read repos_to_scan.json and process batch
           python3 << 'PYEOF'
-          import json, subprocess, os
+          import json, subprocess, os, glob
 
           with open("repos_to_scan.json") as f:
               repos = json.load(f)
@@ -53,14 +77,60 @@ jobs:
           size = int(os.environ.get("SIZE", "${{ github.event.inputs.batch_size }}"))
           batch = repos[start:start+size]
 
+          unity_stubs = os.environ.get("UNITY_STUBS", "")
+          print(f"Unity stubs dir: {unity_stubs}")
+
           print(f"Processing {len(batch)} repos (index {start} to {start+len(batch)-1})")
+
+          def generate_csproj(repo_dir):
+              """Generate a .csproj that includes all .cs files and references Unity stubs."""
+              cs_files = []
+              for root, dirs, files in os.walk(repo_dir):
+                  # Skip common non-source dirs
+                  dirs[:] = [d for d in dirs if d not in ['.git', 'Library', 'Temp', 'obj', 'bin']]
+                  for f in files:
+                      if f.endswith('.cs'):
+                          cs_files.append(os.path.join(root, f))
+
+              # Find Unity stub DLLs
+              dll_refs = ""
+              if unity_stubs and os.path.isdir(unity_stubs):
+                  for dll in glob.glob(os.path.join(unity_stubs, "*.dll")):
+                      dll_refs += f'    <Reference Include="{os.path.splitext(os.path.basename(dll))[0]}"><HintPath>{dll}</HintPath></Reference>\n'
+
+              # Also check other nuget paths for Unity DLLs
+              nuget_base = os.path.expanduser("~/.nuget/packages")
+              for pkg in ["unity3d.unityengine", "unity3d.unityengine.ui", "unity3d.unityeditor"]:
+                  pkg_dir = os.path.join(nuget_base, pkg)
+                  if os.path.isdir(pkg_dir):
+                      for dll in glob.glob(os.path.join(pkg_dir, "**", "*.dll"), recursive=True):
+                          name = os.path.splitext(os.path.basename(dll))[0]
+                          if name not in dll_refs:
+                              dll_refs += f'    <Reference Include="{name}"><HintPath>{dll}</HintPath></Reference>\n'
+
+              csproj_content = f"""<Project Sdk="Microsoft.NET.Sdk">
+            <PropertyGroup>
+              <TargetFramework>net48</TargetFramework>
+              <OutputType>Library</OutputType>
+              <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+              <NoWarn>CS0246;CS0234;CS0103;CS0111;CS0535;CS0115;CS0114;CS0108;CS1061;CS0117;CS0029;CS0266;CS0201;CS8600;CS8601;CS8602;CS8603;CS8604</NoWarn>
+              <TreatWarningsAsErrors>false</TreatWarningsAsErrors>
+            </PropertyGroup>
+            <ItemGroup>
+          {dll_refs}
+            </ItemGroup>
+          </Project>"""
+
+              csproj_path = os.path.join(repo_dir, "UnityProject.csproj")
+              with open(csproj_path, "w") as f:
+                  f.write(csproj_content)
+              return csproj_path, len(cs_files)
 
           results = []
           for i, item in enumerate(batch):
               repo = item["repo"]
               commit_raw = item["commit"]
               bug_id = item["bug_id"]
-              # Remove ~1, we'll handle parent in git
               commit = commit_raw.replace("~1", "")
 
               print(f"\n{'='*60}")
@@ -69,7 +139,7 @@ jobs:
               print(f"{'='*60}")
 
               repo_dir = f"target_{i}"
-              result = {"bug_id": bug_id, "repo": repo, "commit": commit, "db_ok": False, "findings": {}}
+              result = {"bug_id": bug_id, "repo": repo, "commit": commit, "db_ok": False, "build_ok": False, "findings": {}}
 
               try:
                   # Clone
@@ -88,7 +158,6 @@ jobs:
                       capture_output=True, text=True, cwd=repo_dir, timeout=30
                   )
                   if r.returncode != 0:
-                      # Try checkout the commit itself
                       r = subprocess.run(
                           ["git", "checkout", commit],
                           capture_output=True, text=True, cwd=repo_dir, timeout=30
@@ -98,28 +167,57 @@ jobs:
                           results.append(result)
                           continue
 
-                  # Count C# files
-                  cs_count = subprocess.run(
-                      ["bash", "-c", f"find {repo_dir} -name '*.cs' | wc -l"],
-                      capture_output=True, text=True
-                  )
-                  print(f"C# files: {cs_count.stdout.strip()}")
+                  # Generate .csproj with Unity stub references
+                  csproj_path, cs_count = generate_csproj(repo_dir)
+                  print(f"C# files: {cs_count}")
+                  print(f"Generated {csproj_path}")
 
-                  # Create CodeQL database (skip build for Unity projects)
+                  # Try dotnet build (may have errors but CodeQL can still extract)
+                  r = subprocess.run(
+                      ["dotnet", "build", csproj_path, "--no-restore", "-warnaserror-"],
+                      capture_output=True, text=True, timeout=180
+                  )
+                  # Try restore first then build
+                  if r.returncode != 0:
+                      subprocess.run(["dotnet", "restore", csproj_path], capture_output=True, text=True, timeout=60)
+                      r = subprocess.run(
+                          ["dotnet", "build", csproj_path],
+                          capture_output=True, text=True, timeout=180
+                      )
+
+                  if r.returncode == 0:
+                      result["build_ok"] = True
+                      print("Build succeeded!")
+                  else:
+                      print(f"Build had errors (CodeQL may still work): {r.stderr[:200]}")
+
+                  # Create CodeQL database with dotnet build as command
                   r = subprocess.run(
                       ["codeql", "database", "create", f"db_{i}",
                        "--language=csharp",
                        f"--source-root={repo_dir}",
-                       "--command=true",
+                       f"--command=dotnet build {csproj_path} --no-incremental",
                        "--search-path=codeql-repo"],
                       capture_output=True, text=True, timeout=300
                   )
                   if r.returncode != 0:
                       print(f"DB creation failed: {r.stderr[:300]}")
-                      results.append(result)
-                      continue
+                      # Try again allowing errors
+                      r = subprocess.run(
+                          ["codeql", "database", "create", f"db_{i}",
+                           "--language=csharp",
+                           f"--source-root={repo_dir}",
+                           f"--command=dotnet build {csproj_path} --no-incremental || true",
+                           "--search-path=codeql-repo"],
+                          capture_output=True, text=True, timeout=300
+                      )
+                      if r.returncode != 0:
+                          print(f"DB creation failed again: {r.stderr[:300]}")
+                          results.append(result)
+                          continue
 
                   result["db_ok"] = True
+                  print("CodeQL database created")
 
                   # Run each query
                   queries = {
@@ -143,7 +241,7 @@ jobs:
                       if r.returncode == 0 and os.path.exists(out_csv):
                           with open(out_csv) as cf:
                               lines = cf.readlines()
-                          hits = max(0, len(lines) - 1)  # minus header
+                          hits = max(0, len(lines) - 1)
                           result["findings"][qname] = hits
                           print(f"  {qname}: {hits} findings")
                       else:
@@ -154,7 +252,6 @@ jobs:
                   print(f"Error: {e}")
 
               finally:
-                  # Cleanup to save disk
                   subprocess.run(["rm", "-rf", repo_dir, f"db_{i}"], capture_output=True)
 
               results.append(result)
@@ -165,15 +262,17 @@ jobs:
           print(f"{'='*60}")
           total_bugs = len(results)
           db_ok = sum(1 for r in results if r["db_ok"])
+          build_ok = sum(1 for r in results if r["build_ok"])
           detected = sum(1 for r in results if r["db_ok"] and sum(v for v in r["findings"].values() if v > 0) > 0)
 
           print(f"Total bugs: {total_bugs}")
+          print(f"Build succeeded: {build_ok}")
           print(f"DB created successfully: {db_ok}")
           print(f"Bugs with XRFix findings: {detected}")
           print(f"Detection rate: {detected}/{db_ok} = {detected/max(db_ok,1)*100:.1f}%")
 
           with open("all_results/batch_summary.json", "w") as f:
-              json.dump({"results": results, "total": total_bugs, "db_ok": db_ok, "detected": detected}, f, indent=2)
+              json.dump({"results": results, "total": total_bugs, "build_ok": build_ok, "db_ok": db_ok, "detected": detected}, f, indent=2)
 
           PYEOF
 
