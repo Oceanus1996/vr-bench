@@ -23,16 +23,24 @@ jobs:
 
       - name: Setup CodeQL
         run: |
-          wget -q https://github.com/github/codeql-cli-binaries/releases/download/v2.19.0/codeql-linux64.zip
+          wget -q https://github.com/github/codeql-cli-binaries/releases/download/v2.16.3/codeql-linux64.zip
           unzip -q codeql-linux64.zip
           echo "$PWD/codeql" >> $GITHUB_PATH
-          git clone --depth 1 --branch codeql-cli/v2.19.0 https://github.com/github/codeql.git codeql-repo
+          git clone --depth 1 --branch codeql-cli/v2.16.3 https://github.com/github/codeql.git codeql-repo
 
       - name: Run batch scan
         run: |
           START=${{ github.event.inputs.batch_start }}
           SIZE=${{ github.event.inputs.batch_size }}
           mkdir -p all_results
+
+          # Copy XRFix queries into codeql-repo so they can resolve imports
+          mkdir -p codeql-repo/csharp/ql/src/unityCheck/allocate
+          mkdir -p codeql-repo/csharp/ql/src/unityCheck/instantiate
+          mkdir -p codeql-repo/csharp/ql/src/unityCheck/rigidbody
+          cp xrfix_queries/allocate/*.ql codeql-repo/csharp/ql/src/unityCheck/allocate/
+          cp xrfix_queries/instantiate/*.ql codeql-repo/csharp/ql/src/unityCheck/instantiate/
+          cp xrfix_queries/rigidbody/*.ql codeql-repo/csharp/ql/src/unityCheck/rigidbody/
 
           # Read repos_to_scan.json and process batch
           python3 << 'PYEOF'
@@ -102,7 +110,7 @@ jobs:
                       ["codeql", "database", "create", f"db_{i}",
                        "--language=csharp",
                        f"--source-root={repo_dir}",
-                       "--build-mode=none",
+                       "--command=true",
                        "--search-path=codeql-repo"],
                       capture_output=True, text=True, timeout=300
                   )
@@ -115,10 +123,10 @@ jobs:
 
                   # Run each query
                   queries = {
-                      "new_alloc": "xrfix_queries/allocate/comp_new_allocation.ql",
-                      "destroy": "xrfix_queries/instantiate/comp_destroy_in_update.ql",
-                      "instantiate": "xrfix_queries/instantiate/comp_instan_in_update.ql",
-                      "rigidbody": "xrfix_queries/rigidbody/comp_rigidbody_transform_in_update.ql",
+                      "new_alloc": "codeql-repo/csharp/ql/src/unityCheck/allocate/comp_new_allocation.ql",
+                      "destroy": "codeql-repo/csharp/ql/src/unityCheck/instantiate/comp_destroy_in_update.ql",
+                      "instantiate": "codeql-repo/csharp/ql/src/unityCheck/instantiate/comp_instan_in_update.ql",
+                      "rigidbody": "codeql-repo/csharp/ql/src/unityCheck/rigidbody/comp_rigidbody_transform_in_update.ql",
                   }
 
                   for qname, qpath in queries.items():
@@ -140,7 +148,7 @@ jobs:
                           print(f"  {qname}: {hits} findings")
                       else:
                           result["findings"][qname] = -1
-                          print(f"  {qname}: FAILED - {r.stderr[:100]}")
+                          print(f"  {qname}: FAILED - {r.stderr[:500]}")
 
               except Exception as e:
                   print(f"Error: {e}")
