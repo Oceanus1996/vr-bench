@@ -23,10 +23,10 @@ jobs:
 
       - name: Setup CodeQL
         run: |
-          wget -q https://github.com/github/codeql-cli-binaries/releases/download/v2.16.3/codeql-linux64.zip
+          wget -q https://github.com/github/codeql-cli-binaries/releases/download/v2.19.0/codeql-linux64.zip
           unzip -q codeql-linux64.zip
           echo "$PWD/codeql" >> $GITHUB_PATH
-          git clone --depth 1 --branch codeql-cli/v2.16.3 https://github.com/github/codeql.git codeql-repo
+          git clone --depth 1 --branch codeql-cli/v2.19.0 https://github.com/github/codeql.git codeql-repo
 
       - name: Run batch scan
         run: |
@@ -97,12 +97,12 @@ jobs:
                   )
                   print(f"C# files: {cs_count.stdout.strip()}")
 
-                  # Create CodeQL database
+                  # Create CodeQL database (skip build for Unity projects)
                   r = subprocess.run(
                       ["codeql", "database", "create", f"db_{i}",
                        "--language=csharp",
                        f"--source-root={repo_dir}",
-                       "--no-run-unnecessary-builds",
+                       "--build-mode=none",
                        "--search-path=codeql-repo"],
                       capture_output=True, text=True, timeout=300
                   )
