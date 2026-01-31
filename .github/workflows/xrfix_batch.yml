@@ -1,0 +1,117 @@
+name: XRFix Batch Analysis
+
+# Batch-run XRFix queries against multiple Unity repos
+# Reads repo list from repos_to_scan.json
+
+on:
+  workflow_dispatch:
+
+jobs:
+  load-repos:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.set-matrix.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: set-matrix
+        run: |
+          echo "matrix=$(cat repos_to_scan.json)" >> $GITHUB_OUTPUT
+
+  xrfix-scan:
+    needs: load-repos
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      max-parallel: 5
+      matrix:
+        include: ${{ fromJson(needs.load-repos.outputs.matrix) }}
+
+    steps:
+      - name: Checkout benchmark repo
+        uses: actions/checkout@v4
+
+      - name: Setup CodeQL
+        run: |
+          # Download CodeQL CLI
+          wget -q https://github.com/github/codeql-cli-binaries/releases/download/v2.16.3/codeql-linux64.zip
+          unzip -q codeql-linux64.zip
+          export PATH="$PWD/codeql:$PATH"
+          echo "$PWD/codeql" >> $GITHUB_PATH
+
+          # Clone CodeQL standard library (needed for C# queries)
+          git clone --depth 1 --branch v2.16.3 https://github.com/github/codeql.git codeql-repo
+
+      - name: Clone target repo
+        run: |
+          git clone --depth 500 https://github.com/${{ matrix.repo }} target_repo
+          cd target_repo
+          git checkout ${{ matrix.commit }} || echo "WARN: checkout failed"
+          CS_COUNT=$(find . -name "*.cs" | wc -l)
+          echo "C# files: $CS_COUNT"
+
+      - name: Create CodeQL database
+        id: create_db
+        continue-on-error: true
+        run: |
+          codeql database create codeql-db \
+            --language=csharp \
+            --source-root=target_repo \
+            --no-run-unnecessary-builds \
+            --search-path=codeql-repo \
+            2>&1 | tail -20
+
+      - name: Run all XRFix queries
+        if: steps.create_db.outcome == 'success'
+        continue-on-error: true
+        run: |
+          # Copy custom queries into codeql-repo structure
+          mkdir -p codeql-repo/csharp/ql/src/unityCheck
+          cp -r xrfix_queries/* codeql-repo/csharp/ql/src/unityCheck/
+
+          RESULTS_DIR="results_${{ matrix.bug_id }}"
+          mkdir -p $RESULTS_DIR
+
+          for ql_file in xrfix_queries/*/*.ql; do
+            QUERY_NAME=$(basename "$ql_file" .ql)
+            echo "=== Running $QUERY_NAME ==="
+            codeql database analyze codeql-db \
+              "$ql_file" \
+              --format=csv \
+              --output="$RESULTS_DIR/${QUERY_NAME}.csv" \
+              --search-path=codeql-repo \
+              --additional-packs=codeql-repo \
+              2>&1 | tail -5
+
+            if [ -f "$RESULTS_DIR/${QUERY_NAME}.csv" ]; then
+              HITS=$(tail -n +2 "$RESULTS_DIR/${QUERY_NAME}.csv" | wc -l)
+              echo "$QUERY_NAME: $HITS findings"
+            else
+              echo "$QUERY_NAME: failed"
+            fi
+          done
+
+      - name: Generate summary
+        run: |
+          RESULTS_DIR="results_${{ matrix.bug_id }}"
+          echo "repo=${{ matrix.repo }}" > "$RESULTS_DIR/summary.txt"
+          echo "bug_id=${{ matrix.bug_id }}" >> "$RESULTS_DIR/summary.txt"
+          echo "commit=${{ matrix.commit }}" >> "$RESULTS_DIR/summary.txt"
+          echo "db_created=${{ steps.create_db.outcome }}" >> "$RESULTS_DIR/summary.txt"
+
+          TOTAL=0
+          for f in "$RESULTS_DIR"/*.csv; do
+            if [ -f "$f" ]; then
+              C=$(tail -n +2 "$f" | wc -l)
+              TOTAL=$((TOTAL + C))
+              echo "$(basename $f): $C" >> "$RESULTS_DIR/summary.txt"
+            fi
+          done
+          echo "total_findings=$TOTAL" >> "$RESULTS_DIR/summary.txt"
+          cat "$RESULTS_DIR/summary.txt"
+
+      - name: Upload results
+        uses: actions/upload-artifact@v4
+        with:
+          name: xrfix-${{ matrix.bug_id }}
+          path: results_${{ matrix.bug_id }}/

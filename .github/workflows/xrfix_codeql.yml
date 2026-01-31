@@ -1,0 +1,152 @@
+name: XRFix CodeQL Analysis
+
+# Runs XRFix's 4 CodeQL queries against Unity/C# VR repos
+# to measure how many bugs XRFix can detect
+
+on:
+  workflow_dispatch:
+    inputs:
+      repo_url:
+        description: 'Target repo URL (e.g. https://github.com/ExtendRealityLtd/VRTK)'
+        required: true
+      commit_sha:
+        description: 'Commit SHA to analyze (buggy version, i.e. parent of fix commit)'
+        required: true
+      bug_id:
+        description: 'Bug ID for tracking (e.g. repo__issue123)'
+        required: true
+
+jobs:
+  xrfix-scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout benchmark repo (contains XRFix queries)
+        uses: actions/checkout@v4
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v3
+        with:
+          languages: csharp
+          # Don't use default queries, we only want XRFix's custom ones
+          queries: +./xrfix_queries
+
+      - name: Clone target repo at buggy commit
+        run: |
+          git clone --depth 200 ${{ github.event.inputs.repo_url }} target_repo
+          cd target_repo
+          git checkout ${{ github.event.inputs.commit_sha }}
+          echo "Checked out ${{ github.event.inputs.commit_sha }}"
+          # Count C# files
+          find . -name "*.cs" | wc -l
+
+      - name: Build (attempt, may fail for Unity projects)
+        continue-on-error: true
+        run: |
+          cd target_repo
+          # Try dotnet build if .sln or .csproj exists
+          if ls *.sln 2>/dev/null || find . -name "*.csproj" -maxdepth 3 | head -1; then
+            dotnet build || echo "Build failed, continuing with no-build analysis"
+          else
+            echo "No .sln/.csproj found, skipping build"
+          fi
+
+      - name: Create CodeQL database (no-build mode for Unity)
+        run: |
+          codeql database create codeql-db \
+            --language=csharp \
+            --source-root=target_repo \
+            --no-run-unnecessary-builds \
+            2>&1 || \
+          codeql database create codeql-db \
+            --language=csharp \
+            --source-root=target_repo \
+            --build-mode=none \
+            2>&1 || \
+          echo "WARN: CodeQL database creation had issues"
+
+      - name: Run XRFix Query 1 - New allocation in Update
+        id: q1_new_alloc
+        continue-on-error: true
+        run: |
+          codeql database analyze codeql-db \
+            ./xrfix_queries/allocate/comp_new_allocation.ql \
+            --format=csv --output=results_new_alloc.csv \
+            2>&1
+          echo "=== New Allocation in Update ==="
+          cat results_new_alloc.csv 2>/dev/null || echo "No results"
+          wc -l < results_new_alloc.csv 2>/dev/null || echo "0"
+
+      - name: Run XRFix Query 2 - Destroy in Update
+        id: q2_destroy
+        continue-on-error: true
+        run: |
+          codeql database analyze codeql-db \
+            ./xrfix_queries/instantiate/comp_destroy_in_update.ql \
+            --format=csv --output=results_destroy.csv \
+            2>&1
+          echo "=== Destroy in Update ==="
+          cat results_destroy.csv 2>/dev/null || echo "No results"
+          wc -l < results_destroy.csv 2>/dev/null || echo "0"
+
+      - name: Run XRFix Query 3 - Instantiate in Update
+        id: q3_instantiate
+        continue-on-error: true
+        run: |
+          codeql database analyze codeql-db \
+            ./xrfix_queries/instantiate/comp_instan_in_update.ql \
+            --format=csv --output=results_instantiate.csv \
+            2>&1
+          echo "=== Instantiate in Update ==="
+          cat results_instantiate.csv 2>/dev/null || echo "No results"
+          wc -l < results_instantiate.csv 2>/dev/null || echo "0"
+
+      - name: Run XRFix Query 4 - Rigidbody transform in Update
+        id: q4_rigidbody
+        continue-on-error: true
+        run: |
+          codeql database analyze codeql-db \
+            ./xrfix_queries/rigidbody/comp_rigidbody_transform_in_update.ql \
+            --format=csv --output=results_rigidbody.csv \
+            2>&1
+          echo "=== Rigidbody in Update ==="
+          cat results_rigidbody.csv 2>/dev/null || echo "No results"
+          wc -l < results_rigidbody.csv 2>/dev/null || echo "0"
+
+      - name: Summary
+        run: |
+          echo "============================================"
+          echo "XRFix Analysis Summary"
+          echo "Bug ID: ${{ github.event.inputs.bug_id }}"
+          echo "Repo: ${{ github.event.inputs.repo_url }}"
+          echo "Commit: ${{ github.event.inputs.commit_sha }}"
+          echo "============================================"
+          echo ""
+          for f in results_*.csv; do
+            if [ -f "$f" ]; then
+              COUNT=$(tail -n +2 "$f" | wc -l)
+              echo "$f: $COUNT findings"
+            fi
+          done
+          echo ""
+          TOTAL=0
+          for f in results_*.csv; do
+            if [ -f "$f" ]; then
+              C=$(tail -n +2 "$f" | wc -l)
+              TOTAL=$((TOTAL + C))
+            fi
+          done
+          echo "TOTAL FINDINGS: $TOTAL"
+          if [ "$TOTAL" -gt 0 ]; then
+            echo "STATUS: XRFix detected issues in this commit"
+          else
+            echo "STATUS: XRFix found nothing (bug not in XRFix's scope)"
+          fi
+
+      - name: Upload results
+        uses: actions/upload-artifact@v4
+        with:
+          name: xrfix-results-${{ github.event.inputs.bug_id }}
+          path: |
+            results_*.csv
